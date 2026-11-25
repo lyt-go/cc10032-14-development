@@ -77,5 +77,25 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 变更捕获：事务级批量投递
+
+`change_capture` 支持按源库、日志段、事务标识整笔接收变更（多条事件一次提交），
+替代逐事件写日志的旧链路（`capture_changes` 保留兼容）。固定前缀 `/api/cdc`：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/cdc/configs/{id}/transactions` | 整笔事务接收，回执持久化提交位置 `commit_pos`、日志段与事务内顺序 `seq`，逐条事件/逐表写入确认回写投递清单 |
+| `POST /api/cdc/configs/{id}/retransmit` | 重传原事务，只补齐未确认事件与表写入，已确认部分跳过，变更日志按事件幂等不重复 |
+| `GET /api/cdc/configs/{id}/deliveries` | 投递清单；半笔事务为「部分确认」，不会被列为成功 |
+| `GET /api/cdc/configs/{id}/deliveries/{txn_id}` | 单笔事务逐条确认状态复核 |
+| `GET /api/cdc/configs/{id}/progress` | 确认水位：只按连续完成的事务推进，返回最早缺口 |
+| `GET /api/cdc/configs/{id}/resume` | 续采位置：后事务先送达也不跳过较早未确认事务 |
+| `POST /api/cdc/configs/{id}/log-index` | 登记源日志段内按提交位置排序的事务索引 |
+| `GET /api/cdc/configs/{id}/conflicts` | 同事务标识不同内容的冲突记录（保留冲突，独立配置交付不受影响） |
+
+事件级故障注入：在 event 上带 `fail_tables` 可模拟该表写入失败，用于验证半笔
+事务查询、重传补齐与水位停驻。验收测试见
+`backend/tests/test_cdc_transaction_delivery.py`。
+
 领域：数据工程
 子方向：数仓与数据湖

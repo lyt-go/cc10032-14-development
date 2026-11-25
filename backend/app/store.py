@@ -133,6 +133,12 @@ class Store:
         self._lineage_graph: dict[str, list[dict[str, Any]]] = {}
         # 归档清单（cold_archive → retention 共享）
         self._archive_manifest: list[dict[str, Any]] = []
+        # CDC 事务级投递（change_capture 专用）：整笔事务的投递清单/冲突/源日志索引
+        self._cdc_deliveries: dict[str, dict[str, Any]] = {}
+        self._cdc_conflicts: list[dict[str, Any]] = []
+        self._cdc_log_index: dict[int, list[dict[str, Any]]] = {}
+        # 变更日志事件幂等键：保证同一投递事件只落一次日志
+        self._changelog_event_keys: set[tuple] = set()
 
     # ---------- 基础 CRUD ----------
     def module_names(self) -> list[str]:
@@ -239,6 +245,66 @@ class Store:
 
     def archive_manifest_for_table(self, table_name: str) -> list[dict[str, Any]]:
         return [r for r in self._archive_manifest if r.get("源表名称") == table_name]
+
+    # ---------- 变更日志（幂等写入） ----------
+    def append_changelog_once(self, entry: dict[str, Any], dedup_key: tuple) -> bool:
+        """按 (投递编号, 事件键) 幂等写入变更日志，同一事件只落一次。"""
+        if dedup_key in self._changelog_event_keys:
+            return False
+        self._changelog_event_keys.add(dedup_key)
+        self.append_changelog(entry)
+        return True
+
+    def changelog_event_key_count(self, dedup_key: tuple) -> int:
+        return 1 if dedup_key in self._changelog_event_keys else 0
+
+    # ---------- CDC 事务级投递清单 ----------
+    def save_cdc_delivery(self, manifest: dict[str, Any]) -> None:
+        self._cdc_deliveries[manifest["delivery_id"]] = manifest
+
+    def get_cdc_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        return self._cdc_deliveries.get(delivery_id)
+
+    def find_cdc_delivery(self, config_id: int, txn_id: str) -> dict[str, Any] | None:
+        for manifest in self._cdc_deliveries.values():
+            if manifest["config_id"] == config_id and manifest["txn_id"] == txn_id:
+                return manifest
+        return None
+
+    def cdc_deliveries_for_config(self, config_id: int) -> list[dict[str, Any]]:
+        rows = [m for m in self._cdc_deliveries.values() if m["config_id"] == config_id]
+        return sorted(rows, key=lambda m: m["received_ts"])
+
+    # ---------- CDC 事务冲突 ----------
+    def record_cdc_conflict(self, conflict: dict[str, Any]) -> None:
+        self._cdc_conflicts.append(conflict)
+
+    def cdc_conflicts_for_config(self, config_id: int) -> list[dict[str, Any]]:
+        return [c for c in self._cdc_conflicts if c["config_id"] == config_id]
+
+    # ---------- CDC 源日志段事务索引 ----------
+    def stage_cdc_transactions(self, config_id: int, transactions: list[dict[str, Any]]) -> int:
+        """登记源库某日志段内按提交位置排序的事务索引（幂等，按事务标识去重）。"""
+        index = self._cdc_log_index.setdefault(config_id, [])
+        known = {item["txn_id"] for item in index}
+        added = 0
+        for txn in transactions:
+            txn_id = str(txn["txn_id"])
+            if txn_id in known:
+                continue
+            index.append({
+                "txn_id": txn_id,
+                "log_segment": str(txn.get("log_segment", "")),
+                "commit_pos": int(txn["commit_pos"]),
+                "event_count": int(txn.get("event_count", 0)),
+            })
+            known.add(txn_id)
+            added += 1
+        index.sort(key=lambda item: item["commit_pos"])
+        return added
+
+    def cdc_log_index(self, config_id: int) -> list[dict[str, Any]]:
+        return list(self._cdc_log_index.get(config_id, []))
 
 
 store = Store()
